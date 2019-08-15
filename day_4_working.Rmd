@@ -1,0 +1,619 @@
+---
+title: "Day 4 working document"
+author: "Ethan Brown"
+date: "August 11, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(broom)
+library(broom.mixed)
+library(ez)
+library(lme4) # Mixed effect modeling
+
+source("functions.R") # contains ICC.GAU and rANOVA_chisq functions, useful for mixed-effect modeling
+
+
+
+
+```
+
+## Joining together data
+The datasets `students` and `schools` are derived from the National Education Longitudinal Study of 1988, and adapted from https://stats.idre.ucla.edu/stat/stata/examples/mlm_imm/imm23.dta
+
+```{r}
+students = read.csv("students.csv")
+schools = read.csv("schools.csv")
+```
+
+```{r}
+nrow(students)
+```
+
+```{r}
+nrow(schools)
+```
+
+We want this in one dataset to run regression because we also want to analyze some of the school-level variables. We want to be able to see whether a particular student is at a public or a private school.
+
+But wait!  What if there are students that don't match any existing school?  Or schools that don't match any existing student?
+
+There are two most important ways to merge these data. 
+  - `inner_join(x, y)` keeps records that are in BOTH x and y and DISCARDS data that only in one
+  - `left_join(x, y)` keeps ALL records in x; when x doesn't match y, the y columns are NA
+  
+```{r}
+merged_inner = inner_join(students, schools)
+nrow(merged_inner)
+```
+
+Note that R gave us a message that it was joining `by = "schid"`.  R looked for what matched in `students` and `schools` and found that `schid` was in both. It's better practice to explicitly tell R this, because sometimes R's guesses are not helpful!  From now on, we'll always specify the `by` argument.
+
+
+```{r}
+merged_left_students = left_join(students, schools, by = "schid")
+nrow(merged_left_students)
+```
+
+```{r}
+merged_left_schools = left_join(schools, students, by = "schid")
+nrow(merged_left_schools)
+```
+
+
+
+### CHALLENGE
+
+What values did NOT match between the students and schools datasets?  This detective work is often important for figuring out errors/issues in data collection!
+
+```{r}
+
+```
+
+
+
+
+## Single-level regression
+
+Let's use the `merged_inner` dataset. I'll call this `imm23`
+
+```{r}
+imm23 = merged_inner
+```
+
+
+0. What variables are in the data? What are the correlations among the variables?
+```{r}
+
+```
+
+
+1. Suppose we want to understand how weekly hours spent on math homework (`homework`) predicts math achievement (`math`). Run a linear regression analyzing this relationship.
+
+```{r}
+
+```
+
+
+2. Look at the diagnostics.  Are there any problems in the model?
+
+```{r}
+
+```
+
+3. These are data from 23 different schools. Plot the residuals vs. fitted values separately *by school* (`schid`) using facets in `ggplot`.  What do you notice?
+
+```{r}
+
+```
+
+4. Plot *regression lines* separately by school.  HINT: You don't need to fit any models: facet by `schid` and use `geom_smooth(method = 'lm')` to plot the regression lines.
+
+```{r}
+
+```
+
+## Fitting separate regressions
+
+Above we plotted separate regressions using `ggplot2`, but it's also handy to be able to actually fit the different regressions.  We can fit data by group using `dplyr::do()`.
+
+```{r}
+sep_mods = imm23 %>% 
+  group_by(schid) %>% 
+  do(mod = lm(math ~ homework, data = .))
+
+sep_mods
+```
+ When we assign the result to "mod", we create a column contains a separate model for each school.  `sep_mods$mod` is actually a *list* and we can access an individual model just as if we were looking at a list, so here we look at the first one, school 6053:
+ 
+```{r}
+summary(sep_mods$mod[[1]])
+```
+ 
+Of course, this isn't very convenient.  We want to get the intercepts and slopes, which we can add using `dplyr::mutate()` and `coef()`.
+
+```{r}
+sep_coefs = sep_mods %>% 
+  mutate(intercept = coef(mod)[1],
+         slope = coef(mod)[2])
+
+sep_coefs
+```
+
+Are intercepts and slopes related?
+
+```{r}
+ggplot(sep_coefs, aes(intercept, slope)) +
+  geom_point()
+```
+
+
+```{r}
+cor(sep_coefs$intercept, sep_coefs$slope)
+```
+
+So it seems like: 1) average achievement differs by group, 2) homework slope differs by group, 3) there is a negative correlation between group-specific intercepts and slopes.
+
+Note that estimating separate regressions by group gives us the same results as if we added a dummy variables for each school, which is easy to do in R:
+
+```{r}
+imm23$schid_factor = factor(imm23$schid)
+
+imm_fixed = lm(math ~ schid_factor + schid_factor * homework, data = imm23)
+
+coef(imm_fixed)
+```
+
+
+## Introducing lme4
+
+### Random intercepts model (no predictor)
+
+```{r}
+imm_ri = lmer(math ~ 1 + (1 | schid), data = imm23)
+
+summary(imm_ri)
+```
+Note we now have 
+```{r}
+icc_manual = 26.12 / (81.24 + 26.12)
+icc_manual
+```
+
+```{r}
+ICC.GAU(imm_ri, "schid")
+```
+
+Test: is it different from 0?
+```{r}
+rANOVA_chisq(imm_ri)
+```
+
+## Random intercepts with predictor
+
+```{r}
+imm_ri_hw = lmer(math ~ 1 + homework + (1 | schid), data = imm23)
+
+summary(imm_ri_hw)
+```
+
+## Random intercepts and slopes
+
+```{r}
+imm_rs = lmer(math ~ 1 + homework + (1 + homework | schid), data = imm23)
+```
+
+Uh oh! Model failed to converge.
+
+Let's just try upping the number of runs
+
+```{r}
+imm_rs = lmer(math ~ 1 + homework + (1 + homework | schid), data = imm23, 
+              control = lmerControl(optCtrl = list(maxfun=2e5)))
+
+```
+
+Still no success -- try a different numerical optimizer
+
+More info here: https://rstudio-pubs-static.s3.amazonaws.com/33653_57fc7b8e5d484c909b615d8633c01d51.html
+
+```{r}
+imm_rs = lmer(math ~ 1 + homework + (1 + homework | schid), data = imm23, 
+              control = lmerControl(optimizer = "bobyqa",
+                optCtrl = list(maxfun=2e5)))
+
+summary(imm_rs)
+```
+If it ain't broke ...
+
+Note HW is substantially smaller now!
+
+How does this fit compare to the previous?
+
+```{r}
+lmer_fit = coef(imm_rs)$schid %>% 
+  mutate(schid = rownames(.) %>% as.integer) %>% 
+  select(schid, everything()) %>% 
+  arrange(schid)
+
+data_list = list(Original_Regression = sep_mods_coef,
+                 LMER = lmer_fit)
+
+all_data = bind_rows(data_list, .id = "Model_Type")
+
+```
+
+```{r}
+ggplot(all_data, aes(x = `(Intercept)`, 
+                     y = `homework`,
+                     color = Model_Type)) +
+  geom_text(mapping = aes(label = schid))
+```
+
+### Uncorrelated random intercepts and slopes
+
+By default, `lmer` estimates the correlation between intercepts and slopes.  We can also estimate assuming they are not correlated by creating two separate random effect terms:
+
+```{r}
+imm_rs_un = lmer(math ~ 1 + homework + (1 | schid) + (0 + homework | schid),
+                 data = imm23)
+
+summary(imm_rs_un)
+```
+Notice no "corr" term.
+
+## Exploring merMod objects
+
+
+```{r}
+coef(imm_rs)
+```
+
+```{r}
+ranef(imm_rs)
+```
+
+```{r}
+fixef(imm_rs)
+```
+
+```{r}
+VarCorr(imm_rs)
+```
+
+```{r}
+tidy(imm_rs)
+```
+
+```{r}
+glance(imm_rs)
+```
+
+## Gimme p-values!!!!
+
+OK.  But: it's complicated. See http://bbolker.github.io/mixedmodels-misc/glmmFAQ.html#testing-hypotheses
+
+On thing we can do right from `lme4` is a likelihood ratio test comparing models. Refits with REML = FALSE and uses a log-likelihood chi-square test.
+
+```{r}
+anova(imm_ri, imm_ri_hw, imm_rs_un, imm_rs)
+```
+
+Explore residuals
+```{r}
+plot(imm_rs)
+
+```
+
+### lmerTest
+
+Creates "pretty good" p-values. The best way would be to use bootstrap confidence intervals, not shown here.  When lmerTest is loaded, the `summary` and `anova` commands work differently.
+
+```{r}
+library(lmerTest)
+
+summary(imm_ri)
+
+```
+
+
+```{r}
+summary(imm_ri_hw)
+```
+
+```{r}
+summary(imm_rs)
+```
+
+There you go.  I hope you're happy.
+
+```{r}
+anova(imm_ri, imm_ri_hw, imm_rs)
+```
+
+
+## Mini-Capstone
+
+The `emotion` dataset contains information on participants' rating of neutral and negative pictures of faces and people. Each participant rated 48 different pictures on their "Subjective Valence" where -100 is the most negative and 100 is the most positive.  This data is taken from the `psycho` package; original source is unknown.
+
+Run a 2 (Category: Faces or People) x 2 (Emotion Condition: Negative or Neutral) repeated measures ANOVA on these data.  What are the main effects and interactions?
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+Calculate the unconditonal ICC. How much evidence is there of differences between subjects?
+
+```{r}
+
+```
+
+
+Fit a mixed effect model that mirrors the repeated measures ANOVA.
+
+```{r}
+```
+
+
+Does percieved Autobiographical_Link make a difference?  Does Autobiographical link interact with the categories/conditions?
+
+```{r}
+```
+
+______________________________________________________________
+
+## More than one random effect
+One advantage of lmer over RM-ANOVA is it is very easy to include MULTIPLE random effects.  
+
+What if we view the items as random as well?
+
+```{r}
+em_mod = lmer(Subjective_Valence ~ 1 + Item_Category * Emotion_Condition + (1 | Participant_ID) + (1 | Item_Name) ,
+              data = emotion)
+
+summary(em_mod)
+```
+
+### CHALLENGE
+
+Test the addition of the random effects to the model
+
+```{r}
+
+```
+
+
+## Reshaping data, part 2
+
+Sometimes we have multiple measurements at each time point.
+
+```{r}
+multiple_pre_post = read.csv("multiple_pre_post.csv")
+multiple_pre_post
+```
+
+
+We WANT: 1 column for Participant, 1 column for TestTime (Pre or Post), 1 column for Measure1 and 1 column for Measure2.
+
+First we gather everything:
+```{r}
+multiple_long1 = gather(multiple_pre_post,
+                       key = "Time_and_Measure",
+                       value = "Score", 
+                       names(multiple_pre_post)[-1])
+
+multiple_long1
+```
+
+We can separate time and measure into separate columns. Each value contains 2 pieces of information, separated by a `_`. We can separate using ... `separate()`!
+
+```{r}
+multiple_long2 = multiple_long1 %>% 
+  separate(Time_and_Measure, by = "_", into = c("TestTime", "Measure"))
+multiple_long2
+```
+
+Now we can `spread()` Measure and Score -- this creates columns for each possible value of `Measure`.
+
+```{r}
+multiple_covary = multiple_long2 %>% 
+  spread(key = Measure,
+         value = Score)
+
+multiple_covary
+```
+
+
+## Adding data by rows
+
+Sometimes we just want to bring more than one data set together -- they have mostly the same columns, but we just want to add the rows together.
+
+The `bind_rows()` function is handy for this.
+
+### Method 1: separate data frames
+
+Here read in both data files in the folder `Jeff_Experiment`, and bring together with `rbind_all`.
+
+```{r}
+p1337 = read.csv("Jeff_Experiment/1337_parity_2019_Mar_06_1721_2.csv")
+
+p3012 = read.csv("Jeff_Experiment/3012_parity_2019_Mar_05_1304_2.csv")
+
+```
+
+```{r}
+p_both_1 = bind_rows(p1337, p3012)
+```
+
+Did it! Note that `bind_rows` turned all factors to strings -- why do you think this makes sense?
+
+`.id = "data_name"` just created a column with the name of the original object to help us track where it came from
+
+### Method 2:  give R a vector of files
+
+We have just two here, but what about if we have many files? We can feed R a vector of files
+
+```{r}
+file_names = c("Jeff_Experiment/1337_parity_2019_Mar_06_1721_2.csv",
+               "Jeff_Experiment/3012_parity_2019_Mar_05_1304_2.csv")
+
+all_files = lapply(file_names, read.csv)
+str(all_files)
+```
+Let's set the names of the `all_files` object to be the file name, just so we know which is which.
+```{r}
+names(all_files) = file_names
+
+str(all_files)
+```
+
+```{r}
+all_files$`Jeff_Experiment/1337_parity_2019_Mar_06_1721_2.csv`
+```
+
+Now bind together!
+
+```{r}
+p_both_2 = bind_rows(all_files, .id = "file_name")
+```
+
+What did `.id = "file_name" do`?
+
+### Method 3: Show R where the files are
+
+```{r}
+dir()
+```
+```{r}
+dir("Jeff_Experiment/")
+```
+
+```{r}
+dir("Jeff_Experiment/", full.names = T)
+```
+
+```{r}
+dir("Jeff_Experiment/", pattern = "csv", full.names = T)
+```
+
+### CHALLENGE
+
+Read all the CSV files in "ANT_Experiment" into a single data.frame.  Be sure that the data frame has a column that contains the original filename.
+
+```{r}
+
+```
+   
+
+
+
+
+## Longitudinal data
+
+Time has a bit more structure now
+
+```{r}
+ggplot(sleepstudy, aes(Days, Reaction)) +
+  facet_wrap(~ Subject) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+A few weird values, but linearity looks not bad
+
+We can still look at unconditional means to look at between- and within- subject variance
+
+```{r}
+
+sm_un = lmer(Reaction ~ (1 | Subject), data = sleepstudy)
+
+summary(sm_un)
+```
+Look at ICC again
+```{r}
+ICC.GAU(sm_un, "Subject")
+```
+
+```{r}
+rANOVA_chisq(sm_un)
+```
+ Unsuprisingly, a very large p value
+ 
+ Add time
+```{r}
+sm_t = lmer(Reaction ~ Days + (1 | Subject), data = sleepstudy)
+
+summary(sm_t)
+```
+ 
+Are there random slopes by S?
+
+```{r}
+sm_t2 = lmer(Reaction ~ Days + (1 + Days | Subject), data = sleepstudy)
+
+summary(sm_t2)
+```
+
+Actually, we've added parameters both for variance of slopes AND a correlation between slopes and intercepts.  Let's assume orthogonal:
+
+```{r}
+sm_t3 = lmer(Reaction ~ Days + (1 | Subject) + (0 + Days | Subject), data = sleepstudy)
+
+summary(sm_t3)
+```
+
+```{r}
+anova(sm_t, sm_t3, sm_t2)
+```
+Looks like the Days slopes are significant, but not much evidence of a correlation between the slope and the intercept.
+
+
+## Generalized linear models
+We can fit logistic mixed models by just extending to `glmer`. Easy peasy.
+
+Recall the emotions data, let's use that.  We'll use "Recall" as the outcome variable, whether they remembered it 20 minutes later.
+
+Unconditional model:
+
+```{r}
+recall_un = glmer(Recall ~ (1 | Participant_ID), family = binomial, data = emotion)
+
+summary(recall_un)
+```
+
+Again, we can do crossed random effects
+```{r}
+recall_cross = glmer(Recall ~ (1 | Participant_ID) + (1 | Item_Name), family = binomial, data = emotion)
+
+summary(recall_cross)
+```
+
+Did trial order affect this?
+
+```{r}
+recall_trial = glmer(Recall ~ Trial_Order + (1 | Participant_ID) + (1 | Item_Name), family = binomial, data = emotion)
+
+summary(recall_trial)
+```
+
+Testing nested models
+
+```{r}
+anova(recall_un, recall_cross, recall_trial)
+```
+
+
+## Day 4 Capstone
+
+Read in `diving2000.csv`.
+
+Fit a linear mixed effects model with uncorrelated random effects for person, judge, and task.  Note: you may have to reshape the data somewhat!
+
+What percentage of the overall variation is due to person?  To judge?  To task?  Could any of these be removed from the model?
+
